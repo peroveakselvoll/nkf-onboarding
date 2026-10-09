@@ -443,6 +443,7 @@
 </head>
 <body>
 
+<div id="storage-warning" style="display:none;background:#fff3cd;color:#5c4400;padding:8px 16px;font-size:13px;text-align:center;border-bottom:1px solid #e6c96a">⚠ Nettleseren blokkerer lagring (f.eks. forhåndsvisning i Teams/SharePoint). Åpne siden direkte i nettleseren via lenken, ellers huskes ikke fremdriften.</div>
 <div class="brand-strip"><span style="background:var(--nkf-lime)"></span><span style="background:var(--nkf-mist)"></span><span style="background:var(--nkf-slate)"></span><span style="background:var(--nkf-olive)"></span></div>
 
 <header>
@@ -788,20 +789,90 @@ const SYNC = {
   base: "https://api.jsonbin.io/v3/b/"
 };
 let syncPushTimer = null;
-let syncing = false;
+let syncRunning = false;
+let syncQueued = false;
+let storageOk = true;
+let stamps = {};      // tidsstempel per nøkkel (ms)
+let snapshot = {};    // siste kjente verdier, for å oppdage endringer
+
+function binConfigured(){ return SYNC.binId && SYNC.binId.indexOf("SETT_INN") !== 0; }
+let lastClock = 0;
+function clockNow(){ lastClock = Math.max(Date.now(), lastClock + 1); return lastClock; }
 
 function setSyncStatus(text, ok){
   const el = document.getElementById('sync-status');
   if(!el) return;
   el.textContent = text;
-  el.classList.toggle('sync-ok', !!ok);
+  el.classList.toggle('sync-ok', ok === true);
   el.classList.toggle('sync-bad', ok === false);
 }
+function describeSyncError(e){
+  const m = String((e && e.message) || e);
+  if(/ 401| 403/.test(m)) return "Ingen tilgang til delt lagring (sjekk API-nøkkel)";
+  if(/ 404/.test(m)) return "Fant ikke delt lagring (sjekk Bin ID)";
+  if(/ 429/.test(m)) return "Delt lagring er midlertidig full (for mange kall) — lagret lokalt, prøver igjen";
+  if(/Failed to fetch|NetworkError|Load failed|blocked|Refused/i.test(m)) return "Ingen nettverk eller blokkert — lagret lokalt";
+  return "Kunne ikke synkronisere — lagret lokalt";
+}
 
-async function fetchRemoteState(){
-  const res = await fetch(SYNC.base + SYNC.binId + "/latest", {
-    headers: { "X-Master-Key": SYNC.apiKey }
+// Pakke: { v:2, d:{nøkkel:verdi|null}, t:{nøkkel:tid} }. Gammelt flatt format får tid 0.
+function emptyPack(){ return {v:2, d:{}, t:{}}; }
+function normalizePack(raw){
+  if(!raw || typeof raw !== 'object') return emptyPack();
+  if(raw.v === 2 && raw.d && raw.t) return {v:2, d:Object.assign({}, raw.d), t:Object.assign({}, raw.t)};
+  const p = emptyPack();
+  Object.keys(raw).forEach(k => { if(k === 'seed') return; p.d[k] = raw[k]; p.t[k] = 0; });
+  return p;
+}
+function mergePacks(a, b){ // nyeste tidsstempel vinner per nøkkel
+  const out = emptyPack();
+  const keys = new Set([].concat(Object.keys(a.d), Object.keys(a.t), Object.keys(b.d), Object.keys(b.t)));
+  keys.forEach(k => {
+    const ta = a.t[k] === undefined ? -1 : a.t[k];
+    const tb = b.t[k] === undefined ? -1 : b.t[k];
+    const src = (tb > ta) ? b : a;
+    if(src.t[k] === undefined) return;
+    out.d[k] = (k in src.d) ? src.d[k] : null;
+    out.t[k] = src.t[k];
   });
+  return out;
+}
+function localPack(){
+  const p = emptyPack();
+  Object.keys(stamps).forEach(k => { p.t[k] = stamps[k]; p.d[k] = (k in state) ? state[k] : null; });
+  return p;
+}
+function adoptPack(p){
+  const s = {};
+  Object.keys(p.d).forEach(k => { if(p.d[k] !== null && p.d[k] !== undefined) s[k] = p.d[k]; });
+  state = s; stamps = Object.assign({}, p.t); snapshot = Object.assign({}, s);
+}
+function persistLocal(){
+  try{
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(localPack()));
+    if(!storageOk){ storageOk = true; const w = document.getElementById('storage-warning'); if(w) w.style.display = 'none'; }
+    return true;
+  }catch(e){
+    storageOk = false; showStorageWarning(); return false;
+  }
+}
+function showStorageWarning(){
+  const w = document.getElementById('storage-warning');
+  if(w) w.style.display = 'block';
+}
+function stampChanges(){
+  const now = clockNow();
+  const keys = new Set([].concat(Object.keys(state), Object.keys(snapshot)));
+  keys.forEach(k => {
+    const a = (k in state) ? state[k] : undefined;
+    const b = (k in snapshot) ? snapshot[k] : undefined;
+    if(JSON.stringify(a) !== JSON.stringify(b)) stamps[k] = now;
+  });
+  snapshot = Object.assign({}, state);
+}
+
+async function fetchRemoteRecord(){
+  const res = await fetch(SYNC.base + SYNC.binId + "/latest", { headers: { "X-Master-Key": SYNC.apiKey } });
   if(!res.ok){
     const body = await res.text().catch(()=> "");
     throw new Error("GET " + res.status + " " + res.statusText + " — " + body);
@@ -809,15 +880,11 @@ async function fetchRemoteState(){
   const data = await res.json();
   return data.record || {};
 }
-
-async function pushRemoteState(mergedState){
+async function pushRemotePack(pack){
   const res = await fetch(SYNC.base + SYNC.binId, {
     method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Master-Key": SYNC.apiKey
-    },
-    body: JSON.stringify(mergedState)
+    headers: { "Content-Type": "application/json", "X-Master-Key": SYNC.apiKey },
+    body: JSON.stringify(pack)
   });
   if(!res.ok){
     const body = await res.text().catch(()=> "");
@@ -825,59 +892,59 @@ async function pushRemoteState(mergedState){
   }
 }
 
-// Henter andres status ved åpning og fletter inn i det som allerede er lagret lokalt.
-async function syncOnLoad(){
-  setSyncStatus("Henter status fra andre …");
-  try{
-    const remote = await fetchRemoteState();
-    state = Object.assign({}, remote, state); // lokale endringer (om noen) vinner ved konflikt på samme nøkkel
-    saveState({skipRemote:true});
-    applyState();
-    setSyncStatus("Synkronisert", true);
-  }catch(e){
-    console.error("[sync] Henting feilet:", e.message);
-    setSyncStatus("Fikk ikke hentet delt status — viser lokal", false);
+// Henter delt status, fletter (nyeste endring per felt vinner), skriver tilbake bare hvis noe lokalt er nyere.
+async function syncNow(){
+  if(!binConfigured()){
+    setSyncStatus("Kun lagret i denne nettleseren (delt lagring ikke satt opp)", false);
+    return;
   }
-}
-
-// Flettesammen-push: henter siste fra andre rett før lagring, så vi ikke overskriver deres ferske endringer.
-async function pushWithMerge(){
-  if(syncing) return;
-  syncing = true;
-  setSyncStatus("Lagrer til delt status …");
+  if(syncRunning){ syncQueued = true; return; }
+  syncRunning = true;
+  setSyncStatus("Synkroniserer …");
   try{
-    const remote = await fetchRemoteState();
-    const merged = Object.assign({}, remote, state);
-    await pushRemoteState(merged);
-    state = merged;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    setSyncStatus("Synkronisert", true);
+    do{
+      syncQueued = false;
+      const remote = normalizePack(await fetchRemoteRecord());
+      const local = localPack();
+      const merged = mergePacks(remote, local);
+      if(JSON.stringify(merged) !== JSON.stringify(remote)) await pushRemotePack(merged);
+      // endringer gjort mens vi ventet på nettverket må ikke forsvinne
+      adoptPack(mergePacks(merged, localPack()));
+      persistLocal();
+      applyState();
+    }while(syncQueued);
+    setSyncStatus("Synkronisert " + new Date().toLocaleTimeString('no-NO', {hour:'2-digit', minute:'2-digit'}), true);
   }catch(e){
-    console.error("[sync] Lagring feilet:", e.message);
-    setSyncStatus("Kunne ikke synkronisere — lagret lokalt", false);
+    console.error("[sync]", e.message);
+    setSyncStatus(describeSyncError(e), false);
   }finally{
-    syncing = false;
+    syncRunning = false;
   }
 }
 
 function loadState(){
   try{
-    const raw = localStorage.getItem(STORAGE_KEY);
-    state = raw ? JSON.parse(raw) : {};
-  }catch(e){ state = {}; }
+    localStorage.setItem(STORAGE_KEY + "-probe", "1");
+    localStorage.removeItem(STORAGE_KEY + "-probe");
+  }catch(e){ storageOk = false; }
+  let raw = null;
+  try{ raw = JSON.parse(localStorage.getItem(STORAGE_KEY) || "null"); }catch(e){}
+  adoptPack(normalizePack(raw));
 }
 let saveIndicatorTimer = null;
 function saveState(opts){
-  try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){}
+  stampChanges();
+  const ok = persistLocal();
   const ind = document.getElementById('save-indicator');
   if(ind){
+    ind.textContent = ok ? "✓ Lagret" : "⚠ Ikke lagret (blokkert)";
     ind.classList.add('show');
     clearTimeout(saveIndicatorTimer);
-    saveIndicatorTimer = setTimeout(() => ind.classList.remove('show'), 1400);
+    saveIndicatorTimer = setTimeout(() => ind.classList.remove('show'), ok ? 1400 : 5000);
   }
   if(!(opts && opts.skipRemote)){
     clearTimeout(syncPushTimer);
-    syncPushTimer = setTimeout(pushWithMerge, 600); // debounce ved raske klikk
+    syncPushTimer = setTimeout(syncNow, 600);
   }
 }
 
@@ -1343,7 +1410,12 @@ function activate(id){
 
 loadState();
 render();
-syncOnLoad();
+if(!storageOk) showStorageWarning();
+syncNow();
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState === 'visible' && Date.now() - (window.__lastSync||0) > 30000){ window.__lastSync = Date.now(); syncNow(); }
+});
+window.__lastSync = Date.now();
 
 SEARCH_INDEX = buildSearchIndex();
 DAY_SLOTS = buildDaySlots();
